@@ -27,6 +27,7 @@ KEY_PROPERTIES = {
     'stargazers': ['user_id'],
     'releases': ['id'],
     'tags': ['node_id'],
+    'tag_commits': ['id'],
     'reviews': ['id'],
     'review_comments': ['id'],
     'pr_commits': ['id'],
@@ -251,6 +252,17 @@ def generate_pr_commit_schema(commit_schema):
 
     return pr_commit_schema
 
+def generate_tag_commits_schema(commit_schema):
+    tag_commit_schema = commit_schema.copy()
+    tag_commit_schema['properties']['id'] = {
+        "type":  ["null", "string"]
+    }
+    tag_commit_schema['properties']['tag_name'] = {
+        "type": ["null", "string"]
+    }
+
+    return tag_commit_schema
+
 def load_schemas():
     schemas = {}
 
@@ -261,6 +273,7 @@ def load_schemas():
             schemas[file_raw] = json.load(file)
 
     schemas['pr_commits'] = generate_pr_commit_schema(schemas['commits'])
+    schemas['tag_commits'] = generate_tag_commits_schema(schemas['commits'])
     return schemas
 
 class DependencyException(Exception):
@@ -784,7 +797,6 @@ def get_all_releases(schemas, repo_path, state, mdata, _start_date):
 
 def get_all_tags(schemas, repo_path, state, mdata, _start_date):
     # The volume of tags can safely be considered low
-
     with metrics.record_counter('tags') as counter:
         for response in authed_get_all_pages(
                 'tags',
@@ -792,14 +804,34 @@ def get_all_tags(schemas, repo_path, state, mdata, _start_date):
         ):
             tags = response.json()
             extraction_time = singer.utils.now()
+            previous_tag = None
+
             for t in tags:
                 t['_sdc_repository'] = repo_path
 
                 # transform and write release record
                 with singer.Transformer() as transformer:
-                    rec = transformer.transform(t, schemas, metadata=metadata.to_map(mdata))
+                    rec = transformer.transform(t, schemas['tags'], metadata=metadata.to_map(mdata['tags']))
                 singer.write_record('tags', rec, time_extracted=extraction_time)
                 singer.write_bookmark(state, repo_path, 'tags', {'since': singer.utils.strftime(extraction_time)})
+
+                if schemas.get('tag_commits'):
+                    if previous_tag != None:
+                        for comparison in get_commits_between_tags(
+                            previous_tag,
+                            t['name'],
+                            previous_tag,
+                            schemas['tag_commits'],
+                            repo_path,
+                            state,
+                            mdata['tag_commits']
+                        ):
+                            singer.write_record('tag_commits', comparison, time_extracted=extraction_time)
+                            singer.write_bookmark(state, repo_path, 'tag_commits', {'since': singer.utils.strftime(extraction_time)})
+
+                previous_tag = t['name']
+
+
                 counter.increment()
 
     return state
@@ -914,6 +946,25 @@ def get_commits_for_pr(pr_number, pr_id, schema, repo_path, state, mdata):
             commit['pr_number'] = pr_number
             commit['pr_id'] = pr_id
             commit['id'] = '{}-{}'.format(pr_id, commit['sha'])
+            with singer.Transformer() as transformer:
+                rec = transformer.transform(commit, schema, metadata=metadata.to_map(mdata))
+            yield rec
+
+        return state
+
+def get_commits_between_tags(tag_name, base, head, schema, repo_path, state, mdata):
+    basehead = '{}...{}'.format(base, head)
+
+    for response in authed_get_all_pages(
+            'tag_commits',
+            'https://api.github.com/repos/{}/compare/{}'.format(repo_path, basehead)
+    ):
+
+        commit_data = response.json()['commits']
+        for commit in commit_data:
+            commit['_sdc_repository'] = repo_path
+            commit['id'] = '{}-{}'.format(basehead, commit['sha'])
+            commit['tag_name'] = tag_name
             with singer.Transformer() as transformer:
                 rec = transformer.transform(commit, schema, metadata=metadata.to_map(mdata))
             yield rec
@@ -1136,7 +1187,8 @@ SYNC_FUNCTIONS = {
 SUB_STREAMS = {
     'pull_requests': ['reviews', 'review_comments', 'pr_commits'],
     'projects': ['project_cards', 'project_columns'],
-    'teams': ['team_members', 'team_memberships']
+    'teams': ['team_members', 'team_memberships'],
+    'tags': ['tag_commits']
 }
 
 def do_sync(config, state, catalog):
